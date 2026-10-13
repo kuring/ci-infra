@@ -1,0 +1,14 @@
+name: OSDC Broker Fresh 653ee77ef6124041835f1fd7cefad853
+on:
+  pull_request:
+    types: [opened]
+permissions:
+  contents: read
+jobs:
+  drain-fresh:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: osdc-protocol-cab831e11dac44acbfc9436117008965
+    timeout-minutes: 5
+    steps:
+      - name: Fresh routing diagnostic
+        run: echo "Fresh routing diagnostic"
