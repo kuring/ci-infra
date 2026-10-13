@@ -1,4 +1,4 @@
-name: OSDC Drain Test manual01
+name: OSDC Drain Test manual02
 
 on:
   pull_request:
@@ -20,7 +20,7 @@ jobs:
         env:
           PR_URL: ${{ github.event.pull_request.url }}
           GH_TOKEN: ${{ github.token }}
-          RELEASE_MARKER: OSDC_DRAIN_RELEASE_manual01
+          RELEASE_MARKER: OSDC_DRAIN_RELEASE_manual02
         run: |
           python - <<'PY'
           import http.client
