@@ -1,0 +1,20 @@
+name: OSDC Drain Test 3d936ff80b284066b4cd47cfb01e3581
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  drain-inflight:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: osdc-kind-drain
+    timeout-minutes: 45
+    container:
+      image: python:3.12.9-slim
+    steps:
+      - name: Fresh diagnostic job
+        run: python -c 'print("Fresh diagnostic job completed")'
