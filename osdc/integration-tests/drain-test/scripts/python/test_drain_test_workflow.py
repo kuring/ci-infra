@@ -18,7 +18,7 @@ def test_group_pinning_and_release_gate():
     content = generate_workflow("abc123")
     workflow = yaml.safe_load(content)
     assert workflow["name"] == "OSDC Drain Test abc123"
-    assert workflow[True]["pull_request"]["types"] == ["opened"]
+    assert workflow[True]["pull_request"]["types"] == ["opened", "reopened"]
     # Editing the PR body releases the probe; it must not create another run.
     for job in workflow["jobs"].values():
         assert job["runs-on"] == {"group": CLUSTER, "labels": [PROBE_LABEL]}
