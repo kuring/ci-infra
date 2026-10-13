@@ -1,0 +1,18 @@
+name: OSDC SDK Compare bae1c1f8bcf144fc892b3779356c4893
+on:
+  pull_request:
+    types: [opened]
+permissions:
+  contents: read
+jobs:
+  drain-held:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: osdc-sdk-bae1c1f8bcf144fc892b3779356c4893
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        probe: [1, 2, 3]
+    steps:
+      - name: Diagnostic task
+        run: echo "Protocol diagnostic task"
