@@ -1,0 +1,18 @@
+name: OSDC Broker Protocol 5703f0ddc5af41ceb9c32b8ced5601be
+on:
+  pull_request:
+    types: [opened]
+permissions:
+  contents: read
+jobs:
+  drain-held:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: osdc-protocol-5703f0ddc5af41ceb9c32b8ced5601be
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        probe: [1, 2, 3]
+    steps:
+      - name: Diagnostic task
+        run: echo "Protocol diagnostic task"
