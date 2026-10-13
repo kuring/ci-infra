@@ -1,0 +1,176 @@
+name: "~ OSDC: Deploy (reusable)"
+
+on:
+  workflow_call:
+    inputs:
+      cluster:
+        description: "Cluster id from clusters.yaml (e.g. meta-staging-aws-uw1, meta-prod-aws-ue2)"
+        required: true
+        type: string
+      environment:
+        description: "GitHub environment for deployment gating (empty = no gate)"
+        required: false
+        type: string
+        default: ""
+      use_lf_credentials:
+        description: "Use LF_AWS_DEPLOY_ROLE_ARN secret instead of Meta AWS credentials"
+        required: false
+        type: boolean
+        default: false
+      taint_nodes:
+        description: "Taint ARC runner nodes with NoSchedule before deploy for graceful refresh"
+        required: false
+        type: boolean
+        default: true
+      run_smoke:
+        description: "Run smoke tests after deploy"
+        required: false
+        type: boolean
+        default: true
+      run_integration:
+        description: "Run integration tests after deploy (requires CANARY_GITHUB_TOKEN)"
+        required: false
+        type: boolean
+        default: true
+      restart_listeners:
+        description: "Delete and recreate ARC listeners after deploy (required when controller image changes)"
+        required: false
+        type: boolean
+        default: false
+      skip_lint_test:
+        description: "Skip `just lint` and `just test` pre-flight checks (firefighting only)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.cluster }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 180
+    # Serialize all tofu state-mutating work per cluster. Shared with
+    # _osdc-plan.yml so plan and deploy against the same cluster never
+    # race on the DynamoDB state lock.
+    concurrency:
+      group: osdc-tofu-${{ inputs.cluster }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: osdc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up OSDC toolchain
+        uses: ./.github/actions/osdc-setup
+
+      - name: Lint
+        if: ${{ !inputs.skip_lint_test }}
+        run: just lint
+
+      - name: Test
+        if: ${{ !inputs.skip_lint_test }}
+        run: just test
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: ${{ inputs.use_lf_credentials && secrets.LF_AWS_DEPLOY_ROLE_ARN || format('arn:aws:iam::{0}:role/{1}', secrets.META_AWS_ACC_ID, secrets.META_AWS_DEPLOY_ROLE) }}
+          aws-region: us-west-1
+          role-duration-seconds: 7200
+
+      # Register QEMU binfmt handlers so `docker build --platform linux/arm64`
+      # works on an amd64 runner. The base deploy builds image-cache-janitor
+      # (and node-compactor) for both archs; whenever the content-addressed
+      # tag changes (Dockerfile edit, etc.) the build branch runs and needs
+      # cross-arch emulation.
+      # GitHub Actions has no native step retry; retried by duplication.
+      - name: Set up QEMU for cross-arch builds
+        id: setup-qemu
+        continue-on-error: true
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+      - name: Set up QEMU for cross-arch builds (retry)
+        if: ${{ steps.setup-qemu.outcome == 'failure' }}
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+
+      - name: Deploy ${{ inputs.cluster }}
+        run: just deploy "${{ inputs.cluster }}"
+        env:
+          OSDC_CONFIRM: "yes"
+          # smoke runs as a dedicated job below, skip the in-deploy step
+          OSDC_SMOKE: "no"
+          OSDC_TAINT_NODES: ${{ inputs.taint_nodes && 'yes' || 'no' }}
+          ARC_RESTART_LISTENERS: ${{ inputs.restart_listeners && 'yes' || 'no' }}
+
+  smoke:
+    name: Smoke tests
+    needs: deploy
+    if: ${{ inputs.run_smoke }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: osdc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up OSDC toolchain
+        uses: ./.github/actions/osdc-setup
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: ${{ inputs.use_lf_credentials && secrets.LF_AWS_DEPLOY_ROLE_ARN || format('arn:aws:iam::{0}:role/{1}', secrets.META_AWS_ACC_ID, secrets.META_AWS_DEPLOY_ROLE) }}
+          aws-region: us-west-1
+          role-duration-seconds: 7200
+
+      # Smoke failures are usually transient cluster churn (the cluster needs
+      # time to converge after deploy), so retry once after a settle wait.
+      - name: Run smoke tests
+        id: smoke
+        continue-on-error: true
+        run: just smoke "${{ inputs.cluster }}"
+      - name: Wait for cluster to settle before smoke retry
+        if: ${{ steps.smoke.outcome == 'failure' }}
+        run: sleep 180
+      - name: Run smoke tests (retry)
+        if: ${{ steps.smoke.outcome == 'failure' }}
+        run: just smoke "${{ inputs.cluster }}"
+
+  integration:
+    name: Integration tests
+    needs: deploy
+    if: ${{ inputs.run_integration }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: osdc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up OSDC toolchain
+        uses: ./.github/actions/osdc-setup
+
+      - name: Verify gh CLI
+        run: gh --version
+        env:
+          GH_TOKEN: ${{ secrets.CANARY_GITHUB_TOKEN }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: ${{ inputs.use_lf_credentials && secrets.LF_AWS_DEPLOY_ROLE_ARN || format('arn:aws:iam::{0}:role/{1}', secrets.META_AWS_ACC_ID, secrets.META_AWS_DEPLOY_ROLE) }}
+          aws-region: us-west-1
+          role-duration-seconds: 7200
+
+      - name: Run integration tests
+        run: just integration-test "${{ inputs.cluster }}" --skip-drain --skip-smoke --skip-compactor
+        env:
+          GH_TOKEN: ${{ secrets.CANARY_GITHUB_TOKEN }}
