@@ -4,6 +4,12 @@ on:
   merge_group:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      drain_test_noop:
+        description: "Negative control: skip drain in the drain/undrain test (expected slow-test failure)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   id-token: write
@@ -84,7 +90,7 @@ jobs:
     secrets: inherit
 
   # ------------------------------------------------------------------
-  # Slow set: load-test + compactor + janitor. Informational only —
+  # Slow set: load-test -> compactor + janitor -> drain/undrain. Informational only —
   # NOT a merge queue gate. Runs after the fast set succeeds on the
   # same already-deployed staging cluster. The workflow-level
   # concurrency group ensures no other workflow touches staging
@@ -97,6 +103,7 @@ jobs:
     with:
       cluster: meta-staging-aws-uw1
       environment: osdc-staging
+      drain_test_noop: ${{ github.event_name == 'workflow_dispatch' && inputs.drain_test_noop }}
     secrets: inherit
 
   # ------------------------------------------------------------------

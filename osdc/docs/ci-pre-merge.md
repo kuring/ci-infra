@@ -10,7 +10,7 @@ The workflow is defined in `.github/workflows/osdc-pre-merge.yml` and triggers o
 
 1. `changes` — uses `dorny/paths-filter` to detect whether the PR touches osdc-related files. Outputs `osdc: true|false`.
 2. `deploy-fast` — calls reusable `_osdc-deploy.yml` (lint+test → deploy `meta-staging-aws-uw1` → smoke + integration tests). Runs only when osdc files changed.
-3. `slow-tests` — calls reusable `_osdc-slow-tests.yml` (load-test → compactor + janitor). Runs after `deploy-fast` succeeds. Informational only.
+3. `slow-tests` — calls reusable `_osdc-slow-tests.yml` (load-test → compactor + janitor → drain/undrain). Runs after `deploy-fast` succeeds. Informational only. Drain/undrain waits for both compactor and janitor, because it changes runner limits cluster-wide.
 4. `pre-merge-ok` — marker job that always runs and reports SUCCESS when the gate is satisfied.
 
 Dependency chain:
@@ -32,7 +32,7 @@ Dependency chain:
 
 | Aspect            | Fast (`deploy-fast`)                       | Slow (`slow-tests`)                  |
 |-------------------|--------------------------------------------|--------------------------------------|
-| What it runs      | lint + test, deploy meta-staging-aws-uw1, smoke, integration | load-test, compactor e2e, janitor e2e |
+| What it runs      | lint + test, deploy meta-staging-aws-uw1, smoke, integration | load-test, compactor e2e, janitor e2e, drain/undrain |
 | Gates merge?      | Yes (via `pre-merge-ok`)                   | No (informational only)              |
 | Typical duration  | ~30-60 min                                 | ~2-3 h                               |
 | Failure effect    | Blocks merge                               | Surfaces red check, merge still allowed |
@@ -93,6 +93,7 @@ Slow-test failures DO NOT block merges (by design). They surface as a red check 
 - If load-test fails: check that the canary GitHub token still works and that the runner controller is healthy in `meta-staging-aws-uw1`.
 - If compactor fails: investigate node-compactor pod logs in `meta-staging-aws-uw1`.
 - If janitor fails: investigate image-cache-janitor in `meta-staging-aws-uw1`.
+- If drain/undrain fails: check the controller's canary PR/run URL, live `maxRunners`, listener `gha_capacity_advertised_max_runners`, and the recovery step. Missing listener metrics are failures, not evidence of zero capacity. If recovery failed, run `just drain-test meta-staging-aws-uw1 --restore-only` from `osdc/` with staging AWS access. This resumes and verifies configured limits and removal of refresh taints without creating canary jobs.
 
 No notification automation today — see follow-up section.
 
@@ -112,6 +113,34 @@ When none of these change, `deploy-fast` and `slow-tests` are skipped. `pre-merg
 
 To force a re-run of the full battery without a PR: dispatch `osdc-pre-merge.yml` via the Actions UI. `workflow_dispatch` forces `osdc: true` regardless of file changes, so both fast and slow run.
 
+### Drain/undrain test
+
+The controller runs on a GitHub-hosted runner and creates a unique temporary PR in `pytorch/pytorch-canary`. Only that branch's workflows are replaced. Probes are pinned to runner group `meta-staging-aws-uw1` and label `c-mt-l-x86iamx-8-16`; preflight rejects a disabled/missing scale set or a cluster whose live limits do not match `runner_max_map.py`.
+
+One in-flight job waits for a unique marker in its PR body. The controller starts `just drain-runners` in the background, waits for all live runner limits and all listener advertised capacities to become zero, then releases that job. It must succeed normally. Three dependent jobs then queue; for 60 seconds the controller verifies that none is assigned a runner and that capacity remains zero. `just resume-runners` must restore the complete configured limit map, including region-excluded zeros, and remove refresh taints. All held jobs must subsequently succeed on the uw1 runner group.
+
+The controller supplies its own queue/start and completion deadlines (30 minutes each), a drain-convergence deadline (10 minutes), and bounded CLI/API calls. The probes have no warm pool in uw1, and fresh-job sharding means even group-pinned jobs may need to age approximately 15 minutes before capacity is provisioned. Additional runtime consumes the shared `osdc-staging` lock; budget the normal start/completion waits rather than treating this as a quick smoke test. The CI test step is capped at 80 minutes, within a 90-minute job, with a separate 5-minute same-job recovery step.
+
+Cleanup follows the existing slow-test pattern: `finally`, `atexit`, and SIGINT/SIGTERM handling. An active drain subprocess and its children are stopped before resuming, so delayed zero-limit patches cannot race recovery. Recovery is retried up to three times and verified; GitHub cleanup cannot prevent runner restoration. Canary runs are cancelled and the temporary PR/ref removed. CI also attempts verified restoration in an `always()` step. There is **no independent watchdog or recovery workflow**: SIGKILL, runner loss, expired credentials or failed API access can interrupt cleanup. Do not regard a cancelled run as recovered until the live runner limits have been checked.
+
+Offline checks (no AWS/Kubernetes/GitHub credentials or API calls):
+
+```bash
+cd osdc
+uv run --frozen --offline pytest integration-tests/drain-test/scripts/python -v
+just drain-test meta-staging-aws-uw1 --dry-run
+```
+
+The controller sets `OSDC_TAINT_NODES=no` for the drain recipe so a node taint cannot hide the historical zero-limit capacity-monitor bug. Recipes themselves are unchanged.
+
+Live acceptance requires authorized staging access and the existing `CANARY_GITHUB_TOKEN` (canary contents/workflows and PR writes, Actions read/cancel):
+
+1. Dispatch `osdc-pre-merge.yml` from the test branch with `drain_test_noop` left false; the drain/undrain slow test must pass.
+2. Dispatch with `drain_test_noop: true`. This skips the drain command while exercising the same assertions and cleanup; the slow test must fail because live runner limits do not become zero. The informational slow-test failure does not turn `pre-merge-ok` red.
+3. Cancel a normal run after zero limits are observed, then verify all configured runner limits are restored and refresh taints removed. If the process/step is forcibly killed before cleanup completes, use `--restore-only` and record that the cancellation acceptance remains unmet.
+
+A manual dispatch deploys the chosen branch to shared staging, holds the staging lock for the full battery, and can replace a pending merge-queue invocation. Coordinate live acceptance with maintainers; offline unit tests cannot establish it.
+
 ## Known trade-offs (already accepted)
 
 - Queue throughput drops to ~1 PR per 3 hours under sustained load — direct cost of the atomicity guarantee.
@@ -124,4 +153,5 @@ To force a re-run of the full battery without a PR: dispatch `osdc-pre-merge.yml
 |------|------|
 | `.github/workflows/osdc-pre-merge.yml` | Entry point, orchestrates fast + slow + marker job |
 | `.github/workflows/_osdc-deploy.yml` | Reusable: deploy + smoke + integration |
-| `.github/workflows/_osdc-slow-tests.yml` | Reusable: load-test + compactor + janitor |
+| `.github/workflows/_osdc-slow-tests.yml` | Reusable: load-test → compactor + janitor → drain/undrain |
+| `osdc/integration-tests/drain-test/` | Offline assertions/tests, real canary probe template and drain/undrain controller |
