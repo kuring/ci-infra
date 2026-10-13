@@ -2,7 +2,10 @@ name: OSDC Drain Test manual02
 
 on:
   pull_request:
-    types: [opened]
+    # TEMPORARY (2026-10-14, local kind iteration): reopened re-triggers the
+    # same PR. Revert to [opened] before upstreaming; edited/synchronize must
+    # stay out — the release marker is written by editing the PR body.
+    types: [opened, reopened]
 
 permissions:
   contents: read
