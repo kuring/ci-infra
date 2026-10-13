@@ -1,0 +1,18 @@
+name: OSDC Protocol Trace 79997fb047b04447b70b4e0081bcd300
+on:
+  pull_request:
+    types: [opened]
+permissions:
+  contents: read
+jobs:
+  drain-held:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: osdc-trace-c6ccb7e2de344f858072f60476933bcd
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        probe: [1]
+    steps:
+      - name: Diagnostic task
+        run: echo "SDK diagnostic task"
