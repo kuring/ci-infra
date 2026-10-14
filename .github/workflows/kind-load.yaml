@@ -1,0 +1,47 @@
+name: OSDC Kind Load 912428d976c64cbaa493821d4ca5b985
+'on':
+  pull_request:
+    branches:
+    - main
+permissions:
+  contents: read
+concurrency:
+  group: osdc-kind-load-912428d976c64cbaa493821d4ca5b985
+  cancel-in-progress: false
+jobs:
+  load:
+    runs-on: osdc-kind-slow
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/actions/actions-runner:2.338.0
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        index:
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        - 7
+        - 8
+        - 9
+        - 10
+        - 11
+        - 12
+    steps:
+    - name: Verify architecture
+      run: test "$(uname -m)" = "x86_64"
+    - name: Checkout pytorch
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        repository: pytorch/pytorch
+        fetch-depth: 1
+    - name: Report metadata
+      run: 'echo "runner_type=osdc-kind-slow"
+
+        echo "runner_name=${{ runner.name }}"
+
+        echo "matrix_index=${{ matrix.index }}"'
