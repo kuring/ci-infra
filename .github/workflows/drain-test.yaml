@@ -1,0 +1,17 @@
+name: OSDC Startup Smoke 2f438afbe4d94a708d60e308c4f73d8e
+'on':
+  pull_request:
+    types:
+    - opened
+permissions:
+  contents: read
+jobs:
+  startup-smoke:
+    runs-on: osdc-kind-drain
+    timeout-minutes: 5
+    container:
+      image: python:3.12.9-slim
+    steps:
+    - name: Check runner execution
+      run: python -c "import platform,time; print(platform.platform(), flush=True);
+        time.sleep(20)"
