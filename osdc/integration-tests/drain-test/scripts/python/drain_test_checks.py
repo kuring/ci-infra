@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import math
+import sys
+from pathlib import Path
 
 from prometheus_client.parser import text_string_to_metric_families
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "modules" / "arc-runners" / "scripts" / "python"))
+
+from runner_max_map import MAX_INT32
 
 CLUSTER = "meta-staging-aws-uw1"
 CAPACITY_METRIC = "gha_capacity_advertised_max_runners"
@@ -19,7 +25,7 @@ def runner_limits(items: list[dict]) -> dict[str, int]:
         name = item["metadata"]["name"]
         value = item["spec"].get("maxRunners")
         if value is None:
-            value = 2**31 - 1  # Same default as runner_max_map.py and ARC.
+            value = MAX_INT32
         if name in result or type(value) is not int or value < 0:
             raise ValueError(f"Invalid maxRunners snapshot for {name}: {value!r}")
         result[name] = value

@@ -136,8 +136,13 @@ jobs:
 
   drain-test:
     name: Drain/undrain e2e test
+    # Share the per-cluster lock with deploy/plan and manual drain/undrain.
+    concurrency:
+      group: osdc-tofu-${{ inputs.cluster }}
+      cancel-in-progress: false
     # Drain affects every runner; wait for ALL other slow tests to finish.
     needs: [load-test, compactor, janitor]
+    # Cancel the test normally; the always() step attempts bounded recovery.
     if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
@@ -146,12 +151,15 @@ jobs:
       run:
         working-directory: osdc
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - if: ${{ success() && !cancelled() }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up OSDC toolchain
+        if: ${{ success() && !cancelled() }}
         uses: ./.github/actions/osdc-setup
 
       - name: Configure AWS credentials
+        if: ${{ success() && !cancelled() }}
         id: aws
         uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
         with:
@@ -161,13 +169,25 @@ jobs:
 
       - name: Run drain/undrain test
         id: drain
-        # Reserve job time for same-job recovery after the controller times out.
-        timeout-minutes: 80
-        run: just drain-test "${{ inputs.cluster }}"
+        if: ${{ success() && !cancelled() }}
+        # Controller: 45 min main flow + 10 min cleanup + 5 min margin.
+        timeout-minutes: 60
+        run: >-
+          just drain-test "${{ inputs.cluster }}"
+          --defer-recovery --run-timeout 2700 --cleanup-timeout 600
+          --start-timeout 900 --finish-timeout 900 --drain-timeout 300
         env:
           GH_TOKEN: ${{ secrets.CANARY_GITHUB_TOKEN }}
+          OSDC_DRAIN_RECOVERY_FILE: ${{ runner.temp }}/osdc-drain-${{ github.run_id }}-${{ github.run_attempt }}.json
 
       - name: Resume and verify staging runners
-        if: ${{ always() && steps.aws.outcome == 'success' && steps.drain.outcome != 'skipped' }}
-        timeout-minutes: 5
-        run: just drain-test "${{ inputs.cluster }}" --restore-only
+        id: restore
+        if: ${{ always() && steps.aws.outcome == 'success' }}
+        # Three-minute controller budget plus startup margin; cancellation can cut this short.
+        timeout-minutes: 4
+        env:
+          OSDC_DRAIN_RECOVERY_FILE: ${{ runner.temp }}/osdc-drain-${{ github.run_id }}-${{ github.run_attempt }}.json
+        run: |
+          if [[ -f "$OSDC_DRAIN_RECOVERY_FILE" ]]; then
+            just drain-test "${{ inputs.cluster }}" --restore-only --restore-timeout 180
+          fi

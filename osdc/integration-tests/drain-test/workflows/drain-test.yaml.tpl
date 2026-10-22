@@ -3,7 +3,7 @@ name: OSDC Drain Test {{RUN_KEY}}
 on:
   pull_request:
     # Editing the PR body releases the probe and must not create another run.
-    types: [opened]
+    types: [opened, synchronize]
 
 permissions:
   contents: read
@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   drain-inflight:
+    if: github.event.action == 'opened' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on:
       group: meta-staging-aws-uw1
       labels: [c-mt-l-x86iamx-8-16]
@@ -58,6 +59,7 @@ jobs:
           PY
 
   drain-held:
+    if: github.event.action == 'opened' && github.event.pull_request.head.repo.full_name == github.repository
     needs: drain-inflight
     runs-on:
       group: meta-staging-aws-uw1
@@ -72,3 +74,18 @@ jobs:
     steps:
       - name: Complete after undrain
         run: python -c 'print("Held job completed on uw1 after undrain")'
+
+  # New traffic wakes the original queue after capacity restoration
+  # (https://github.com/actions/actions-runner-controller/issues/4715).
+  drain-wakeup:
+    if: github.event.action == 'synchronize' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on:
+      group: meta-staging-aws-uw1
+      labels: [c-mt-l-x86iamx-8-16]
+    timeout-minutes: 5
+    container:
+      image: python:3.12.9-slim
+    steps:
+      - name: Wake original queued jobs
+        run: |
+          python -c 'print("ARC #4715 wakeup")'
