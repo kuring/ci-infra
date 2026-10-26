@@ -1,0 +1,59 @@
+name: OSDC Service Cancel c8064df7a04f4812a9f057c3e413d99f
+'on':
+  pull_request:
+    types:
+    - opened
+    - synchronize
+permissions:
+  contents: read
+jobs:
+  drain:
+    if: ${{ !cancelled() && !failure() && github.event.action == 'opened' }}
+    timeout-minutes: 90
+    concurrency:
+      group: osdc-service-cancel-c8064df7a04f4812a9f057c3e413d99f
+      cancel-in-progress: false
+    name: Cancel drain and recover
+    runs-on:
+    - osdc-service-c8064df7a04f4812a9f057c3e413d99f-drain
+    steps:
+    - name: Check dedicated Kind connection
+      id: aws
+      if: ${{ success() && !cancelled() }}
+      run: just --justfile /root/drain-integrity-20261026/ci-infra-test/osdc/kind/justfile
+        kind-drain-service-step prepare --output /root/drain-integrity-20261026/ci-infra-test/osdc/kind/.state/service-cancel-acceptance-20261026
+        --key c8064df7a04f4812a9f057c3e413d99f
+    - name: Run drain/undrain test
+      id: drain
+      if: ${{ success() && !cancelled() }}
+      timeout-minutes: 60
+      run: just --justfile /root/drain-integrity-20261026/ci-infra-test/osdc/kind/justfile
+        kind-drain-service-step cancel --output /root/drain-integrity-20261026/ci-infra-test/osdc/kind/.state/service-cancel-acceptance-20261026
+        --key c8064df7a04f4812a9f057c3e413d99f
+      env:
+        OSDC_DRAIN_RECOVERY_FILE: ${{ runner.temp }}/osdc-drain-${{ github.run_id
+          }}-${{ github.run_attempt }}.json
+    - name: Resume and verify cluster runners
+      id: restore
+      if: ${{ always() && steps.aws.outcome == 'success' }}
+      timeout-minutes: 8
+      env:
+        OSDC_DRAIN_RECOVERY_FILE: ${{ runner.temp }}/osdc-drain-${{ github.run_id
+          }}-${{ github.run_attempt }}.json
+      run: just --justfile /root/drain-integrity-20261026/ci-infra-test/osdc/kind/justfile
+        kind-drain-service-step restore --output /root/drain-integrity-20261026/ci-infra-test/osdc/kind/.state/service-cancel-acceptance-20261026
+        --key c8064df7a04f4812a9f057c3e413d99f
+  successor:
+    name: Acquire released lock
+    if: ${{ !cancelled() && github.event.action == 'synchronize' }}
+    runs-on:
+    - osdc-service-c8064df7a04f4812a9f057c3e413d99f-next
+    timeout-minutes: 5
+    concurrency:
+      group: osdc-service-cancel-c8064df7a04f4812a9f057c3e413d99f
+      cancel-in-progress: false
+    steps:
+    - name: Verify recovery precedes lock release
+      run: just --justfile /root/drain-integrity-20261026/ci-infra-test/osdc/kind/justfile
+        kind-drain-service-step successor --output /root/drain-integrity-20261026/ci-infra-test/osdc/kind/.state/service-cancel-acceptance-20261026
+        --key c8064df7a04f4812a9f057c3e413d99f
