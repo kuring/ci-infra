@@ -1,0 +1,16 @@
+name: OSDC Drain Test c1ba83b56eb642d4b5951db8e79afc85
+on:
+  pull_request:
+    types: [opened]
+permissions:
+  contents: read
+jobs:
+  drain-inflight:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: osdc-kind-drain
+    timeout-minutes: 5
+    container:
+      image: python:3.12.9-slim
+    steps:
+      - name: Wait for drain
+        run: sleep 120
