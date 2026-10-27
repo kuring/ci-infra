@@ -1,0 +1,18 @@
+name: OSDC Drain Test 8bad9deb426540fe972ac264f2d2a2e8
+on:
+  pull_request:
+    types: [opened]
+permissions:
+  contents: read
+jobs:
+  drain-held:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: osdc-wire-a057637b472c44e68a3750fe9a252ccf
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        probe: [1, 2, 3]
+    steps:
+      - name: Diagnostic task
+        run: echo protocol-diagnostic
