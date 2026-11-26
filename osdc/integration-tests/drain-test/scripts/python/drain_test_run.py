@@ -30,6 +30,7 @@ from threading import Event
 from uuid import uuid4
 
 from drain_test_checks import (
+    CAPACITY_METRIC,
     advertised_capacity,
     held_probe_number,
     listener_pods,
@@ -69,8 +70,9 @@ OBSERVE_TIMEOUT = 120
 # Listener metrics scrape uses a bounded wait even when no controller deadline
 # is active, so cleanup/restore paths cannot hang on the thread pool.
 CAPACITY_TIMEOUT = 2 * 60
-WAKEUP_INTERVAL = 15
-WAKEUP_ATTEMPTS = 8
+# Allow a pod list and a target metrics request, each with a 15-second request timeout.
+HELD_DIAGNOSTIC_TIMEOUT = 30
+HELD_DIAGNOSTIC_INTERVAL = 60
 # Match the unchanged operational recipes in osdc/justfile.
 REFRESH_TAINT_KEY = "deploy.osdc.io/refresh-pending"
 REFRESH_TAINT_VALUE = "true"
@@ -88,6 +90,10 @@ PROBE_RUNNER_NAME = "l-x86iamx-8-16"
 
 class RefreshTaintError(RuntimeError):
     """A surviving node lost a recorded taint; resuming limits cannot repair it."""
+
+
+class RefreshTaintTimeout(TimeoutError):
+    """Refresh-taint verification did not finish within its deadline."""
 
 
 def require_ci_execution() -> None:
@@ -287,16 +293,12 @@ def api(
     payload: dict | None = None,
     method: str = "GET",
     *,
-    repository: str = CANARY_REPO,
-    timeout: float = 30,
     deadline: float | None = None,
 ) -> dict | list:
-    args = ["gh", "api", f"repos/{repository}/{endpoint}".rstrip("/"), "--method", method]
+    args = ["gh", "api", f"repos/{CANARY_REPO}/{endpoint}".rstrip("/"), "--method", method]
     if payload is not None:
         args.extend(["--input", "-"])
-    output = command(
-        args, input=json.dumps(payload) if payload is not None else None, timeout=timeout, deadline=deadline
-    ).stdout
+    output = command(args, input=json.dumps(payload) if payload is not None else None, deadline=deadline).stdout
     # These endpoints legitimately return no response body. Reads and writes
     # that return resources must never turn a malformed response into success.
     if not output.strip() and (method == "DELETE" or (method == "POST" and endpoint.endswith("/cancel"))):
@@ -358,11 +360,10 @@ class DrainTest:
         self.placements: dict[int, dict] = {}
         self.released_probes: set[int] = set()
         self.pending_held_release: str | None = None
+        self.last_unassigned_held_job_ids: list[int] | None = None
         self.drain: subprocess.Popen | None = None
         self.desired: dict[str, int] = {}
         self.probe_ids: dict[str, set[int]] = {}
-        self.assigned_phases: set[str] = set()
-        self.wakeup_intents: dict[tuple[str, int], dict[str, str]] = {}
         self.cleanup_deadline: float | None = None
         self.deadline: float | None = None
         self.recovery_attempts = 0
@@ -394,7 +395,7 @@ class DrainTest:
         """Clamp a blocking operation to the current instance deadline."""
         return remaining(self.deadline, timeout)
 
-    def wait_for(self, description: str, check, timeout: float, poll: float = 10) -> None:
+    def wait_for(self, description: str, check, timeout: float, poll: float = 10, *, between_attempts=None) -> None:
         """Retry convergence/API failures, but let definitive test failures escape."""
         deadline = time.monotonic() + timeout
         last_error = "condition not reached"
@@ -410,7 +411,14 @@ class DrainTest:
                             return
                     except (ValueError, subprocess.SubprocessError) as exc:
                         last_error = str(exc)
-                    time.sleep(self.remaining(poll))
+                    delay = self.remaining(poll)
+                    if between_attempts is not None:
+                        next_poll = time.monotonic() + delay
+                        between_attempts(next_poll)
+                        delay = max(0.0, next_poll - time.monotonic())
+                    time.sleep(delay)
+        except RefreshTaintTimeout:
+            raise
         except TimeoutError as exc:
             raise TimeoutError(f"{description}: deadline exceeded ({last_error})") from exc
 
@@ -504,8 +512,8 @@ class DrainTest:
                 if sig == signal.SIGKILL:
                     raise
 
-    def api(self, endpoint, payload=None, method="GET", *, deadline: float | None = None, **kwargs):
-        return api(endpoint, payload, method, deadline=deadline if deadline is not None else self.deadline, **kwargs)
+    def api(self, endpoint, payload=None, method="GET"):
+        return api(endpoint, payload, method, deadline=self.deadline)
 
     def kube(self, *args, deadline: float | None = None, cancel_event: Event | None = None):
         kwargs = {"cancel_event": cancel_event} if cancel_event is not None else {}
@@ -562,7 +570,7 @@ class DrainTest:
         self.desired = parsed
 
     def capacities(self, expected: set[str] | None = None) -> dict[str, float]:
-        """Scrape all configured listeners, or only the requested scale sets."""
+        """Scrape all configured listeners or only the requested scale sets."""
         pods_data = safe_json_loads(
             self.kube(
                 "get",
@@ -677,7 +685,7 @@ class DrainTest:
         return self.api(f"actions/runs/{self.run_id}/jobs?per_page=100")["jobs"]
 
     def probes(self, phase: str, count: int) -> list[dict]:
-        """Pin the original jobs; wakeup runs must never replace the acceptance probes."""
+        """Verify that the original probe job IDs remain unchanged."""
         jobs = probe_jobs(self.jobs(), phase, count)
         ids = {job.get("id") for job in jobs}
         if len(ids) != count or any(type(job_id) is not int or job_id <= 0 for job_id in ids):
@@ -685,90 +693,7 @@ class DrainTest:
         expected = self.probe_ids.setdefault(phase, ids)
         if ids != expected:
             raise RuntimeError(f"Original {phase} probe jobs changed: {expected} -> {ids}")
-        if any(job.get("runner_id") for job in jobs):
-            self.assigned_phases.add(phase)
         return jobs
-
-    def wakeup(self, phase: str, attempt: int, deadline: float) -> None:
-        """New same-scale-set traffic works around ARC #4715 without rerunning old jobs."""
-        if self.draining or not self.canary_cleanup_needed or self.pr is None or self.run_id is None:
-            raise RuntimeError("Waking probes requires an active canary outside drain")
-
-        def request(endpoint, payload=None, method="GET"):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("ARC #4715 wakeup deadline exceeded")
-            return self.api(endpoint, payload, method, timeout=min(30, remaining))
-
-        head = request(f"git/ref/heads/{self.branch}")["object"]["sha"]
-        intent = self.wakeup_intents.setdefault((phase, attempt), {"parent": head})
-        if intent.get("commit") == head:
-            # A previous PATCH may have succeeded even though its response timed out.
-            log.info("ARC #4715 wakeup %s/%s already applied: %s", phase, attempt, head)
-            return
-        if head != intent["parent"]:
-            raise RuntimeError("Canary branch changed during an unresolved wakeup")
-        if "tree" not in intent:
-            tree = request(f"git/commits/{head}")["tree"]["sha"]
-            intent["tree"] = request(
-                "git/trees",
-                {
-                    "base_tree": tree,
-                    "tree": [
-                        {
-                            "path": ".osdc-drain-wakeup",
-                            "mode": "100644",
-                            "type": "blob",
-                            "content": f"{self.run_key}:{phase}:{attempt}\n",
-                        }
-                    ],
-                },
-                "POST",
-            )["sha"]
-        if "commit" not in intent:
-            intent["commit"] = request(
-                "git/commits",
-                {"message": f"ARC #4715 wakeup {phase} {attempt}", "tree": intent["tree"], "parents": [head]},
-                "POST",
-            )["sha"]
-        # Persist the exact target before PATCH. Retries read HEAD and reuse it,
-        # rather than making a new commit for an ambiguously successful write.
-        request(f"git/refs/heads/{self.branch}", {"sha": intent["commit"], "force": False}, "PATCH")
-
-    def wait_with_wakeup(self, description: str, phase: str, check, timeout: float) -> None:
-        """Send bounded, spaced traffic until original probes receive an assignment."""
-        deadline = time.monotonic() + self.remaining(timeout)
-        attempt = 0
-        pending_attempt = None
-        next_wakeup = time.monotonic()
-
-        def poll():
-            nonlocal attempt, pending_attempt, next_wakeup
-            if self.draining:
-                raise RuntimeError("ARC #4715 wakeup is forbidden during drain")
-            if check():
-                return True
-            if phase in self.assigned_phases:
-                return False
-            if time.monotonic() >= deadline:
-                return False
-            if pending_attempt is not None or (attempt < WAKEUP_ATTEMPTS and time.monotonic() >= next_wakeup):
-                items = self.scale_sets()
-                require_limits(runner_limits(items), self.desired)
-                target = self.check_probe(items)
-                if self.capacities({target}).get(target, 0) <= 0:
-                    raise ValueError(f"Waiting for positive advertised capacity on {target}")
-                if pending_attempt is None:
-                    attempt += 1
-                    pending_attempt = attempt
-                log.info("ARC #4715 workaround: %s wakeup %s/%s", phase, pending_attempt, WAKEUP_ATTEMPTS)
-                self.wakeup(phase, pending_attempt, deadline)
-                pending_attempt = None
-                next_wakeup = time.monotonic() + WAKEUP_INTERVAL
-            return False
-
-        self.wait_for(description, poll, timeout, poll=5)
-        log.info("ARC #4715 workaround: %s completed", phase)
 
     def inflight_ready(self) -> bool:
         jobs = self.probes("inflight", 1)
@@ -826,8 +751,6 @@ class DrainTest:
         original_ids = self.probe_ids.get("held")
         if not original_ids or any(job["id"] not in original_ids for job in held_jobs):
             raise RuntimeError("Original held probe jobs changed or their job IDs were not recorded")
-        if any(job.get("runner_id") for job in held_jobs):
-            self.assigned_phases.add("held")
         visible_numbers = {held_probe_number(job) for job in held_jobs}
         expected = {1, 2, 3}
         unreleased = expected - self.released_probes
@@ -836,6 +759,7 @@ class DrainTest:
             raise RuntimeError(f"Expected one original held job for each unreleased probe number; missing {missing}")
         if not visible_numbers.issubset(expected):
             raise RuntimeError(f"Unexpected held probe numbers: {visible_numbers - expected}")
+        self.last_unassigned_held_job_ids = sorted(job["id"] for job in held_jobs if not job.get("runner_id"))
         snapshot = None
         for job in held_jobs:
             number = held_probe_number(job)
@@ -902,6 +826,45 @@ class DrainTest:
             "All original held jobs succeeded with verified placements; stale UID baseline: %s", self.refresh_nodes
         )
         return True
+
+    def sample_held_diagnostics(
+        self, scale_set: str, deadline: float, samples: dict[str, tuple[float, str]]
+    ) -> dict[str, str]:
+        """Keep the last successful read of each signal even if subsequent reads fail."""
+        readers = {
+            CAPACITY_METRIC: lambda: self.capacities({scale_set})[scale_set],
+            "actual_runner_limits": lambda: runner_limits(self.scale_sets()),
+        }
+        observations = {}
+        for name, read in readers.items():
+            try:
+                with self.deadline_scope(deadline):
+                    value = read()
+                    self.remaining(float("inf"))
+                samples[name] = (time.monotonic(), str(value))
+                observations[name] = ""
+            except Exception as exc:
+                observations[name] = f"unavailable ({str(exc) or type(exc).__name__})"
+        now = time.monotonic()
+        for name, (sampled_at, value) in samples.items():
+            refresh_error = observations[name]
+            observations[name] = f"{value} (sampled {now - sampled_at:.1f}s ago)"
+            if refresh_error:
+                observations[name] += f", refresh {refresh_error}"
+        return observations
+
+    def log_held_timeout(self, scale_set: str, samples: dict[str, tuple[float, str]]) -> None:
+        observations = self.sample_held_diagnostics(scale_set, time.monotonic() + HELD_DIAGNOSTIC_TIMEOUT, samples)
+        log.warning(
+            "Held jobs timed out after undrain: scale_set=%s, last_unassigned_job_ids=%s, "
+            "%s=%s, actual_runner_limits=%s, expected_runner_limits=%s",
+            scale_set,
+            self.last_unassigned_held_job_ids,
+            CAPACITY_METRIC,
+            observations[CAPACITY_METRIC],
+            observations["actual_runner_limits"],
+            self.desired,
+        )
 
     def held_ready(self) -> bool:
         jobs = self.probes("held", 3)
@@ -991,7 +954,10 @@ class DrainTest:
                 )
             return True
 
-        self.wait_for("refresh taints preserved", check, 120, poll=5)
+        try:
+            self.wait_for("refresh taints preserved", check, 120, poll=5)
+        except TimeoutError as exc:
+            raise RefreshTaintTimeout(str(exc)) from exc
 
     def resume(self) -> None:
         """Restore configured limits while preserving refresh taints on surviving nodes."""
@@ -1087,7 +1053,7 @@ class DrainTest:
             self.resume()
             items = self.scale_sets()
         require_limits(runner_limits(items), self.desired)
-        self.check_probe(items)
+        probe_scale_set_name = self.check_probe(items)
         # Establish metric availability before mutating anything.
         self.wait_for("listener metrics available", lambda: bool(self.capacities()), self.args.drain_timeout)
         self.create_pr()
@@ -1133,9 +1099,30 @@ class DrainTest:
         self.observe_held()
         self.taint_runner_nodes()
         self.resume()
-        self.wait_with_wakeup(
-            "held jobs succeed after undrain", "held", self.advance_held_probes, self.args.finish_timeout
-        )
+        held_diagnostics: dict[str, tuple[float, str]] = {}
+        next_sample = time.monotonic()
+
+        def sample_between_attempts(deadline: float) -> None:
+            nonlocal next_sample
+            now = time.monotonic()
+            if now >= next_sample:
+                # Use the existing polling interval so diagnostics share the phase budget.
+                next_sample = now + HELD_DIAGNOSTIC_INTERVAL
+                self.sample_held_diagnostics(probe_scale_set_name, deadline, held_diagnostics)
+
+        try:
+            self.wait_for(
+                "held jobs succeed after undrain",
+                self.advance_held_probes,
+                self.args.finish_timeout,
+                poll=5,
+                between_attempts=sample_between_attempts,
+            )
+        except RefreshTaintTimeout:
+            raise
+        except TimeoutError:
+            self.log_held_timeout(probe_scale_set_name, held_diagnostics)
+            raise
         self.verify_refresh_taints()
 
     def stop_drain(self) -> None:

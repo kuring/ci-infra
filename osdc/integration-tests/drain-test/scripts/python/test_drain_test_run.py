@@ -305,12 +305,16 @@ def test_advance_held_probes_tolerates_released_probe_job_disappearance(placemen
     assert test.released_probes == {1, 2, 3}
 
 
-def test_placement_wait_allows_wakeup_and_single_slot_progress(placement_controller, monkeypatch, clock):
+def test_placement_wait_allows_single_slot_progress_after_restore(placement_controller, monkeypatch, clock):
     test, jobs, _pods, _nodes = placement_controller
     jobs[:] = [gated_job(number, status="queued") for number in (1, 2, 3)]
-    monkeypatch.setattr(test, "capacities", lambda expected=None: {"cpu": 8})
-    wakeup = Mock(side_effect=lambda *args: jobs.__setitem__(0, gated_job(1)))
-    monkeypatch.setattr(test, "wakeup", wakeup)
+
+    def read_jobs():
+        if clock[0] >= 10 and jobs[0]["status"] == "queued":
+            jobs[0] = gated_job(1)
+        return jobs
+
+    monkeypatch.setattr(test, "jobs", read_jobs)
 
     def release(path, body, method):
         assert path == "pulls/42"
@@ -322,10 +326,18 @@ def test_placement_wait_allows_wakeup_and_single_slot_progress(placement_control
                     jobs[number] = gated_job(number + 1)
 
     test.api.side_effect = release
-    test.wait_with_wakeup("held placement and completion", "held", test.advance_held_probes, 30)
+    test.wait_for("held placement and completion", test.advance_held_probes, 30, poll=5)
     assert test.released_probes == {1, 2, 3}
     assert all(item["status"] == "completed" for item in jobs)
-    wakeup.assert_called_once_with("held", 1, 30)
+    markers = [
+        "OSDC_DRAIN_RELEASE_abc123",
+        "OSDC_HELD_RELEASE_abc123_1",
+        "OSDC_HELD_RELEASE_abc123_2",
+        "OSDC_HELD_RELEASE_abc123_3",
+    ]
+    assert test.api.call_args_list == [
+        call("pulls/42", {"body": "\n".join(markers[: number + 1])}, "PATCH") for number in (1, 2, 3)
+    ]
 
 
 @pytest.mark.parametrize("failure", ["job-id", "runner-id", "runner-name", "swapped-job-ids"])
@@ -533,15 +545,13 @@ def test_cancellable_command_preserves_input_and_output_across_polls():
     assert result.stderr == "input complete\n"
 
 
-@pytest.mark.parametrize(("deadline", "expected"), [(None, 20), (10, 10), (0, 0)])
-def test_controller_api_uses_default_or_explicit_deadline(controller, monkeypatch, deadline, expected):
+def test_controller_api_uses_current_deadline(controller, monkeypatch):
     controller.deadline = 20
     api = Mock(return_value={"ok": True})
     monkeypatch.setattr(module, "api", api)
 
-    assert controller.api("issues/1", {"state": "closed"}, "PATCH", deadline=deadline, timeout=5) == {"ok": True}
-    api.assert_called_once_with("issues/1", {"state": "closed"}, "PATCH", deadline=expected, timeout=5)
-    assert controller.deadline == 20
+    assert controller.api("issues/1", {"state": "closed"}, "PATCH") == {"ok": True}
+    api.assert_called_once_with("issues/1", {"state": "closed"}, "PATCH", deadline=20)
 
 
 def test_kubectl_forwards_cancellation_to_command(controller, monkeypatch):
@@ -992,9 +1002,10 @@ def test_scale_sets_and_live_metrics(controller, monkeypatch, bounded):
     )
 
 
-@pytest.mark.parametrize("expected", [None, {"cpu"}, set()])
-def test_capacities_scrapes_only_selected_listeners(controller, monkeypatch, expected):
+@pytest.mark.parametrize("expected", [None, {"cpu"}, set()], ids=["all", "target", "empty"])
+def test_capacities_scrapes_requested_listeners(controller, monkeypatch, expected):
     controller.desired = {"cpu": 8, **{f"other-{i}": 0 for i in range(48)}}
+    # Make every configured listener available for each request.
     pods = [
         {
             "metadata": {"name": f"{name}-7f4d9b7c4f-listener", "labels": {SCALE_SET_LABEL: name}},
@@ -1003,12 +1014,11 @@ def test_capacities_scrapes_only_selected_listeners(controller, monkeypatch, exp
         }
         for name in controller.desired
     ]
-    metrics = {
-        (
-            f"/api/v1/namespaces/arc-systems/pods/{name}-7f4d9b7c4f-listener:8080/proxy/metrics"
-        ): f'{CAPACITY_METRIC}{{name="{name}-ers"}} 0\n'
+    metrics_paths = {
+        name: f"/api/v1/namespaces/arc-systems/pods/{name}-7f4d9b7c4f-listener:8080/proxy/metrics"
         for name in controller.desired
     }
+    metrics = {path: f'{CAPACITY_METRIC}{{name="{name}-ers"}} 0\n' for name, path in metrics_paths.items()}
 
     def read(*args, **kwargs):
         if args[1] == "pods":
@@ -1021,13 +1031,14 @@ def test_capacities_scrapes_only_selected_listeners(controller, monkeypatch, exp
         with pytest.raises(ValueError, match="Missing ready listeners"):
             controller.capacities(expected)
         assert kube.call_count == 1
-    else:
-        names = set(controller.desired) if expected is None else expected
-        assert controller.capacities(expected) == dict.fromkeys(names, 0)
-        assert kube.call_count == 1 + len(names)
-        assert {call.args[2] for call in kube.call_args_list if "--raw" in call.args} == {
-            f"/api/v1/namespaces/arc-systems/pods/{name}-7f4d9b7c4f-listener:8080/proxy/metrics" for name in names
-        }
+        return
+
+    values = controller.capacities(expected)
+    expected_names = set(controller.desired) if expected is None else expected
+    assert values == dict.fromkeys(expected_names, 0)
+    assert kube.call_count == 1 + len(expected_names)
+    scraped_paths = {call.args[2] for call in kube.call_args_list if "--raw" in call.args}
+    assert scraped_paths == {metrics_paths[name] for name in expected_names}
 
 
 @pytest.mark.parametrize(
@@ -1710,8 +1721,7 @@ def test_observation_retries_share_total_budget(observing_controller, clock, rec
     test = observing_controller
     deadlines = []
 
-    def capacities(expected=None):
-        assert expected is None
+    def capacities():
         deadlines.append(test.deadline)
         if recover_at is None or clock[0] < recover_at:
             raise ValueError(failure)
@@ -1734,8 +1744,7 @@ def test_observation_retries_share_total_budget(observing_controller, clock, rec
 def test_observation_slow_check_consumes_total_budget(observing_controller, clock, check_seconds):
     test = observing_controller
 
-    def capacities(expected=None):
-        assert expected is None
+    def capacities():
         assert test.remaining(float("inf")) == 120
         clock[0] += check_seconds
         return {"cpu": 0}
@@ -2130,7 +2139,7 @@ def release_controller(controller, monkeypatch):
         "observe_held",
         "taint_runner_nodes",
         "resume",
-        "wait_with_wakeup",
+        "advance_held_probes",
         "verify_refresh_taints",
     ):
         monkeypatch.setattr(controller, name, Mock(return_value=True))
@@ -2138,6 +2147,135 @@ def release_controller(controller, monkeypatch):
     monkeypatch.setattr(controller, "capacities", lambda: {"cpu": 0})
     monkeypatch.setattr(module.subprocess, "Popen", Mock(return_value=Mock(wait=Mock(return_value=0))))
     return controller
+
+
+@pytest.mark.parametrize(
+    ("run_deadline", "initial_sample", "final_sample", "expected"),
+    [
+        (100, 0.0, 8.0, "8.0 (sampled 0.0s ago)"),
+        (12, 0.0, 8.0, "8.0 (sampled 0.0s ago)"),
+        (
+            100,
+            ValueError("missing listener metric"),
+            ValueError("missing listener metric"),
+            "unavailable (missing listener metric)",
+        ),
+        (100, 8.0, TimeoutError(), "8.0 (sampled 10.0s ago), refresh unavailable (TimeoutError)"),
+        (10, 0.0, None, "0.0 (sampled 10.0s ago), refresh unavailable (Controller deadline exceeded)"),
+    ],
+)
+def test_held_timeout_logs_target_listener_and_last_unassigned_job_ids(
+    release_controller, monkeypatch, clock, caplog, run_deadline, initial_sample, final_sample, expected
+):
+    test = release_controller
+    test.args.finish_timeout = 10
+    held_jobs = [gated_job(number, status="queued") for number in (3, 1, 2)]
+    test.probe_ids["held"] = {job["id"] for job in held_jobs}
+    monkeypatch.delattr(test, "advance_held_probes")
+    monkeypatch.setattr(test, "jobs", Mock(return_value=held_jobs))
+    api = Mock(return_value={})
+    monkeypatch.setattr(test, "api", api)
+
+    def read_capacity(scale_sets=None):
+        if scale_sets is None:
+            return {"cpu": 8}
+        if clock[0] == 0:
+            assert test.deadline == 5
+            sample = initial_sample
+        else:
+            assert clock[0] == 10
+            assert test.deadline == min(run_deadline, 10 + 30)
+            sample = final_sample
+        if isinstance(sample, Exception):
+            raise sample
+        return {"cpu": sample}
+
+    capacities = Mock(side_effect=read_capacity)
+    monkeypatch.setattr(test, "capacities", capacities)
+    with (
+        test.deadline_scope(run_deadline),
+        pytest.raises(
+            TimeoutError, match=r"held jobs succeed after undrain: deadline exceeded \(condition not reached\)"
+        ),
+    ):
+        test.run()
+
+    assert capacities.call_args_list == [call()] + [call({"cpu"})] * (1 if final_sample is None else 2)
+    assert f"scale_set=cpu, last_unassigned_job_ids=[101, 102, 103], {CAPACITY_METRIC}={expected}" in caplog.text
+    assert "actual_runner_limits={'cpu': 8}" in caplog.text
+    assert "expected_runner_limits={'cpu': 8}" in caplog.text
+    api.assert_called_once_with("pulls/42", {"body": "OSDC_DRAIN_RELEASE_abc123"}, "PATCH")
+
+
+@pytest.mark.parametrize("finish_timeout", [10, 180])
+def test_held_taint_verification_timeout_keeps_its_phase(
+    release_controller, monkeypatch, clock, caplog, finish_timeout
+):
+    test = release_controller
+    test.args.finish_timeout = finish_timeout
+    test.refresh_nodes = {"old": "runner"}
+    jobs = [gated_job(number) for number in (1, 2, 3)]
+    test.probe_ids["held"] = {job["id"] for job in jobs}
+    monkeypatch.delattr(test, "advance_held_probes")
+    monkeypatch.delattr(test, "verify_refresh_taints")
+    monkeypatch.setattr(test, "api", Mock(return_value={}))
+    monkeypatch.setattr(test, "jobs", Mock(return_value=jobs))
+    monkeypatch.setattr(test, "kube", Mock(side_effect=subprocess.SubprocessError("node query unavailable")))
+
+    with pytest.raises(TimeoutError, match=r"^refresh taints preserved: deadline exceeded \(node query unavailable\)"):
+        test.run()
+
+    assert clock[0] == min(finish_timeout, 120)
+    assert "Held jobs timed out after undrain" not in caplog.text
+    assert not test.released_probes
+
+
+def test_held_timeout_keeps_latest_diagnostics_within_existing_poll_delay(
+    release_controller, monkeypatch, clock, caplog
+):
+    test = release_controller
+    test.args.finish_timeout = 180
+    polls = []
+    sample_deadlines = []
+
+    def advance():
+        polls.append(clock[0])
+        return False
+
+    def read_capacity(target=None):
+        if target is None:
+            return {"cpu": 8}
+        sample_deadlines.append(test.deadline)
+        module.time.sleep(2)
+        return {"cpu": 8 if clock[0] < 60 else 0}
+
+    monkeypatch.setattr(test, "advance_held_probes", advance)
+    monkeypatch.setattr(test, "api", Mock(return_value={}))
+    monkeypatch.setattr(test, "capacities", read_capacity)
+    monkeypatch.setattr(test, "scale_sets", lambda: ars(8 if clock[0] < 60 else 0))
+    with test.deadline_scope(65), pytest.raises(TimeoutError, match="held jobs succeed after undrain"):
+        test.run()
+
+    assert polls == list(range(0, 65, 5))
+    assert sample_deadlines == [5, 65]
+    assert f"{CAPACITY_METRIC}=0 (sampled 3.0s ago), refresh unavailable" in caplog.text
+    assert "actual_runner_limits={'cpu': 0} (sampled 3.0s ago), refresh unavailable" in caplog.text
+    assert "expected_runner_limits={'cpu': 8}" in caplog.text
+
+
+def test_held_diagnostics_do_not_gate_probe_success(release_controller, monkeypatch, clock, caplog):
+    test = release_controller
+    monkeypatch.setattr(test, "advance_held_probes", Mock(side_effect=[False, True]))
+    monkeypatch.setattr(test, "api", Mock(return_value={}))
+    monkeypatch.setattr(test, "capacities", Mock(side_effect=[{"cpu": 8}, ValueError("missing listener metric")]))
+    monkeypatch.setattr(test, "scale_sets", Mock(side_effect=[ars(), ars(0)]))
+    with test.deadline_scope(30):
+        test.run()
+
+    assert test.advance_held_probes.call_count == 2
+    assert clock[0] == 5
+    assert "Held jobs timed out after undrain" not in caplog.text
+    test.verify_refresh_taints.assert_called_once_with()
 
 
 @pytest.mark.parametrize("error", [subprocess.CalledProcessError(1, "gh"), subprocess.TimeoutExpired("gh", 30)])
@@ -2251,12 +2389,6 @@ def test_controller_orders_drain_release_observe_and_resume(
     popen = Mock(side_effect=launch)
     monkeypatch.setattr(module.subprocess, "Popen", popen)
 
-    def wait_with_wakeup(description, phase, check, timeout):
-        assert phase == "held"
-        assert "resume" in events
-        return check()
-
-    monkeypatch.setattr(controller, "wait_with_wakeup", wait_with_wakeup)
     with controller.deadline_scope(controller.args.run_timeout):
         clock[0] = elapsed
         controller.run()
@@ -2314,7 +2446,7 @@ def test_drain_recipe_covers_slow_probe_teardown_but_still_bounds_pod_wait(
         "create_pr",
         "find_run",
         "inflight_ready",
-        "wait_with_wakeup",
+        "advance_held_probes",
         "stop_drain",
         "observe_held",
         "taint_runner_nodes",
@@ -3337,279 +3469,6 @@ def test_restore_deadline_includes_prepare_and_retries(controller, monkeypatch, 
     assert attempts == [3, 3]
 
 
-def test_wakeup_changes_only_owned_branch_and_preserves_original_run(controller, monkeypatch, clock):
-    controller.pr, controller.run_id, controller.canary_cleanup_needed = 4, 99, True
-    api = Mock(
-        side_effect=[
-            {"object": {"sha": "head"}},
-            {"tree": {"sha": "base-tree"}},
-            {"sha": "wakeup-tree"},
-            {"sha": "wakeup-commit"},
-            {},
-        ]
-    )
-    monkeypatch.setattr(controller, "api", api)
-    controller.wakeup("held", 2, 10)
-    assert api.call_args_list[0] == call(f"git/ref/heads/{controller.branch}", None, "GET", timeout=10)
-    tree = api.call_args_list[2].args[1]
-    assert tree["base_tree"] == "base-tree"
-    assert tree["tree"] == [
-        {"path": ".osdc-drain-wakeup", "mode": "100644", "type": "blob", "content": "abc123:held:2\n"}
-    ]
-    assert api.call_args_list[3].args[1]["parents"] == ["head"]
-    assert api.call_args_list[4] == call(
-        f"git/refs/heads/{controller.branch}", {"sha": "wakeup-commit", "force": False}, "PATCH", timeout=10
-    )
-    assert controller.run_id == 99
-    assert controller.pr == 4
-
-
-@pytest.mark.parametrize("invalid", ["draining", "branch", "pr", "run"])
-def test_wakeup_refuses_drain_or_missing_canary(controller, monkeypatch, invalid):
-    controller.pr, controller.run_id, controller.canary_cleanup_needed = 4, 99, True
-    if invalid == "draining":
-        controller.draining = True
-    elif invalid == "branch":
-        controller.canary_cleanup_needed = False
-    elif invalid == "pr":
-        controller.pr = None
-    else:
-        controller.run_id = None
-    api = Mock()
-    monkeypatch.setattr(controller, "api", api)
-    with pytest.raises(RuntimeError, match="active canary outside drain"):
-        controller.wakeup("held", 1, 10)
-    api.assert_not_called()
-
-
-def test_wakeup_api_calls_share_phase_deadline(controller, monkeypatch, clock):
-    controller.pr, controller.run_id, controller.canary_cleanup_needed = 4, 99, True
-
-    def api(*args, **kwargs):
-        remaining = 7 - clock[0]
-        assert kwargs["timeout"] == min(30, remaining)
-        clock[0] += 5
-        return {"object": {"sha": "head"}, "tree": {"sha": "base-tree"}}
-
-    request = Mock(side_effect=api)
-    monkeypatch.setattr(controller, "api", request)
-    with pytest.raises(TimeoutError, match="wakeup deadline exceeded"):
-        controller.wakeup("held", 1, 7)
-    assert request.call_count == 2  # Deadline expires before any write.
-
-
-@pytest.fixture
-def waking_controller(controller, monkeypatch, clock):
-    monkeypatch.setattr(controller, "scale_sets", lambda: ars())
-    monkeypatch.setattr(controller, "capacities", Mock(return_value={"cpu": 3}))
-    monkeypatch.setattr(controller, "wakeup", Mock())
-    return controller
-
-
-def test_wakeup_stops_after_assignment_and_waits_for_completion(waking_controller, clock):
-    test = waking_controller
-
-    def check():
-        if clock[0] >= 35:
-            test.assigned_phases.add("held")
-        return clock[0] >= 60
-
-    test.wait_with_wakeup("held succeeds", "held", check, 100)
-    assert test.wakeup.call_args_list == [call("held", n, 100) for n in (1, 2, 3)]
-    assert clock[0] == 60
-
-
-def test_wakeup_attempts_are_bounded_then_waits_until_deadline(waking_controller, clock):
-    with pytest.raises(TimeoutError, match="deadline exceeded"):
-        waking_controller.wait_with_wakeup("held succeeds", "held", lambda: False, 130)
-    assert waking_controller.wakeup.call_args_list == [
-        call("held", n, 130) for n in range(1, module.WAKEUP_ATTEMPTS + 1)
-    ]
-    assert waking_controller.capacities.call_args_list == [call({"cpu"})] * module.WAKEUP_ATTEMPTS
-    assert clock[0] == 130
-
-
-def test_early_wakeup_is_repeated_after_broker_capacity_catches_up(waking_controller, clock):
-    test = waking_controller
-    sent = []
-    assigned = False
-
-    def wakeup(phase, attempt, deadline):
-        nonlocal assigned
-        sent.append((clock[0], attempt))
-        # The local metric is already 3, while the first broker poll still used 0.
-        # Pulses before that poll completes are accepted but do not wake old jobs.
-        assigned = clock[0] >= 50
-
-    def check():
-        if assigned:
-            test.assigned_phases.add("held")
-        return assigned
-
-    test.wakeup.side_effect = wakeup
-    test.wait_with_wakeup("held assigned", "held", check, 100)
-    assert sent == [(0, 1), (15, 2), (30, 3), (45, 4), (60, 5)]
-    assert clock[0] == 65
-
-
-def test_each_wakeup_rechecks_capacity_without_consuming_an_attempt(waking_controller, monkeypatch, clock):
-    test = waking_controller
-    monkeypatch.setattr(test, "capacities", lambda expected: {"cpu": 0 if 15 <= clock[0] < 35 else 3})
-    test.wait_with_wakeup("held assigned", "held", lambda: clock[0] >= 40, 100)
-    assert test.wakeup.call_args_list == [call("held", 1, 100), call("held", 2, 100)]
-
-
-def test_wakeup_retries_stay_inside_shared_main_deadline(waking_controller, clock):
-    with waking_controller.deadline_scope(20), pytest.raises(TimeoutError, match="deadline exceeded"):
-        waking_controller.wait_with_wakeup("held assigned", "held", lambda: False, 100)
-    assert waking_controller.wakeup.call_args_list == [call("held", 1, 20), call("held", 2, 20)]
-    assert clock[0] == 20
-
-
-@pytest.mark.parametrize("applied", [False, True])
-def test_wakeup_ref_timeout_reuses_commit_and_verifies_write(controller, monkeypatch, clock, applied):
-    controller.canary_cleanup_needed = True
-    controller.pr, controller.run_id = 42, 10
-    head = "original"
-    writes = []
-    patch_count = 0
-
-    def api(endpoint, payload=None, method="GET", **kwargs):
-        nonlocal head, patch_count
-        if endpoint == f"git/ref/heads/{controller.branch}":
-            return {"object": {"sha": head}}
-        if endpoint == "git/commits/original":
-            return {"tree": {"sha": "base-tree"}}
-        writes.append((endpoint, payload, method))
-        if endpoint == "git/trees":
-            return {"sha": "wakeup-tree"}
-        if endpoint == "git/commits":
-            return {"sha": "wakeup-commit"}
-        assert endpoint == f"git/refs/heads/{controller.branch}"
-        patch_count += 1
-        if patch_count == 1:
-            if applied:
-                head = payload["sha"]
-            raise subprocess.TimeoutExpired("gh", 1)
-        head = payload["sha"]
-        return {}
-
-    monkeypatch.setattr(controller, "api", api)
-    with pytest.raises(subprocess.TimeoutExpired):
-        controller.wakeup("held", 1, 100)
-    controller.wakeup("held", 1, 100)
-    assert head == "wakeup-commit"
-    assert [e for e, _, _ in writes].count("git/trees") == 1
-    assert [e for e, _, _ in writes].count("git/commits") == 1
-    patches = [p for e, p, _ in writes if e.startswith("git/refs/")]
-    assert patches == [{"sha": "wakeup-commit", "force": False}] * (1 if applied else 2)
-    assert controller.run_id == 10
-
-
-def test_unresolved_wakeup_refuses_foreign_branch_update(controller, monkeypatch, clock):
-    controller.canary_cleanup_needed = True
-    controller.pr, controller.run_id = 42, 10
-    controller.wakeup_intents[("held", 1)] = {"parent": "old", "tree": "tree", "commit": "ours"}
-    api = Mock(return_value={"object": {"sha": "foreign"}})
-    monkeypatch.setattr(controller, "api", api)
-    with pytest.raises(RuntimeError, match="branch changed"):
-        controller.wakeup("held", 1, 100)
-    api.assert_called_once_with(f"git/ref/heads/{controller.branch}", None, "GET", timeout=30)
-
-
-@pytest.mark.parametrize("failed_stage", ["git/trees", "git/commits"])
-def test_wakeup_object_write_timeout_never_publishes_an_unconfirmed_commit(
-    controller, monkeypatch, clock, failed_stage
-):
-    controller.canary_cleanup_needed = True
-    controller.pr, controller.run_id = 42, 10
-    calls = []
-    failed = False
-
-    def api(endpoint, payload=None, method="GET", **kwargs):
-        nonlocal failed
-        calls.append((endpoint, payload, method))
-        if endpoint == f"git/ref/heads/{controller.branch}":
-            return {"object": {"sha": "original"}}
-        if endpoint == "git/commits/original":
-            return {"tree": {"sha": "base-tree"}}
-        if endpoint == failed_stage and not failed:
-            failed = True
-            raise subprocess.TimeoutExpired("gh", 1)
-        if endpoint == "git/trees":
-            return {"sha": "tree"}
-        if endpoint == "git/commits":
-            return {"sha": "confirmed-commit"}
-        return {}
-
-    monkeypatch.setattr(controller, "api", api)
-    with pytest.raises(subprocess.TimeoutExpired):
-        controller.wakeup("held", 1, 100)
-    assert not any(method == "PATCH" for _, _, method in calls)
-    controller.wakeup("held", 1, 100)
-    assert [(e, p) for e, p, method in calls if method == "PATCH"] == [
-        (f"git/refs/heads/{controller.branch}", {"sha": "confirmed-commit", "force": False})
-    ]
-
-
-def test_wakeup_waits_for_target_capacity_and_preserves_regional_zeros(waking_controller, monkeypatch, clock):
-    test = waking_controller
-    test.desired["excluded"] = 0
-    monkeypatch.setattr(
-        test,
-        "scale_sets",
-        lambda: [*ars(), {"metadata": {"name": "excluded"}, "spec": {"maxRunners": 0, "runnerScaleSetName": "gpu"}}],
-    )
-    capacities = Mock(side_effect=lambda expected=None: {"cpu": 0 if clock[0] < 15 else 3, "excluded": 0})
-    monkeypatch.setattr(test, "capacities", capacities)
-    test.wait_with_wakeup("inflight starts", "inflight", lambda: clock[0] >= 20, 100)
-    # Capacity is probed every poll interval until it becomes positive at clock=15.
-    assert capacities.call_args_list == [call({"cpu"})] * 4
-    test.wakeup.assert_called_once_with("inflight", 1, 100)
-
-
-@pytest.mark.parametrize("broken", ["limits", "metrics", "target-capacity"])
-def test_wakeup_requires_restored_limits_and_capacity(waking_controller, monkeypatch, clock, broken):
-    test = waking_controller
-    if broken == "limits":
-        monkeypatch.setattr(test, "scale_sets", lambda: ars(0))
-    elif broken == "metrics":
-        monkeypatch.setattr(test, "capacities", Mock(side_effect=ValueError("missing metric")))
-    else:
-        monkeypatch.setattr(test, "capacities", Mock(return_value={"cpu": 0, "another": 3}))
-    with pytest.raises(TimeoutError, match="deadline exceeded"):
-        test.wait_with_wakeup("inflight starts", "inflight", lambda: False, 20)
-    if broken == "limits":
-        test.capacities.assert_not_called()
-    else:
-        # Capacity is probed every poll interval until the deadline.
-        assert len(test.capacities.call_args_list) >= 2
-        assert all(c == call({"cpu"}) for c in test.capacities.call_args_list)
-    test.wakeup.assert_not_called()
-
-
-def test_failed_wakeup_write_is_retried_until_deadline(waking_controller, clock):
-    waking_controller.wakeup.side_effect = subprocess.TimeoutExpired("gh", 1)
-    with pytest.raises(TimeoutError, match="deadline exceeded"):
-        waking_controller.wait_with_wakeup("inflight starts", "inflight", lambda: False, 20)
-    # Transient failures should be retried on every poll interval until the deadline.
-    assert waking_controller.wakeup.call_args_list == [call("inflight", 1, 20)] * 4
-    assert clock[0] == 20
-
-
-def test_workaround_never_wakes_during_drain(waking_controller):
-    waking_controller.draining = True
-    with pytest.raises(RuntimeError, match="forbidden during drain"):
-        waking_controller.wait_with_wakeup("held succeeds", "held", lambda: False, 20)
-    waking_controller.wakeup.assert_not_called()
-
-
-def test_workaround_propagates_original_failure_without_waking(waking_controller):
-    with pytest.raises(RuntimeError, match="wrong group"):
-        waking_controller.wait_with_wakeup("held succeeds", "held", Mock(side_effect=RuntimeError("wrong group")), 20)
-    waking_controller.wakeup.assert_not_called()
-
-
 @pytest.mark.parametrize("invalid", [None, True, 0, -1])
 def test_original_job_ids_must_be_valid(controller, monkeypatch, invalid):
     monkeypatch.setattr(controller, "jobs", lambda: [job(job_id=invalid)])
@@ -3633,7 +3492,7 @@ def test_duplicate_held_job_ids_fail(controller, monkeypatch):
 
 
 @pytest.mark.parametrize("finished", [True, False])
-def test_cleanup_handles_wakeup_completion_race(controller, monkeypatch, finished):
+def test_cleanup_handles_canary_completion_race(controller, monkeypatch, finished):
     controller.canary_cleanup_needed = True
     monkeypatch.setattr(controller, "runs", lambda: [canary_run(99, "in_progress")])
     api = Mock(
@@ -3653,17 +3512,17 @@ def test_cleanup_handles_wakeup_completion_race(controller, monkeypatch, finishe
         assert api.call_count == 3
 
 
-def test_restore_only_and_cleanup_never_wake_probes(controller, monkeypatch, controller_runtime):
+def test_restore_only_makes_no_canary_api_calls(controller, monkeypatch, controller_runtime):
     controller.draining = True
     monkeypatch.setattr(controller, "prepare", Mock())
     monkeypatch.setattr(controller, "recipe", Mock())
     monkeypatch.setattr(controller, "scale_sets", lambda: ars())
     monkeypatch.setattr(controller, "kube", lambda *a: '{"items":[]}')
-    wake = Mock(side_effect=AssertionError("restore must not create wakeup jobs"))
-    monkeypatch.setattr(controller, "wakeup", wake)
+    api = Mock()
+    monkeypatch.setattr(controller, "api", api)
     module.run_controller(controller, restore_only=True)
     assert not controller.draining
-    wake.assert_not_called()
+    api.assert_not_called()
 
 
 @pytest.fixture

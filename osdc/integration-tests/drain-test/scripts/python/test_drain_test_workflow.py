@@ -38,17 +38,19 @@ def test_group_pinning_and_release_gate():
     content = module.generate_workflow("abc123", TEST_PROBE_LABEL, CLUSTER)
     workflow = yaml.safe_load(content)
     assert workflow["name"] == "OSDC Drain Test abc123"
-    assert workflow["on"]["pull_request"]["types"] == ["opened", "synchronize"]
+    assert workflow["on"]["pull_request"]["types"] == ["opened"]
+    assert set(workflow["jobs"]) == {"drain-inflight", "drain-held"}
     # Editing the PR body releases the probe; it must not create another run.
     for job in workflow["jobs"].values():
         assert job["runs-on"] == {"group": CLUSTER, "labels": [TEST_PROBE_LABEL]}
         assert int(job["timeout-minutes"]) > 0
-        assert "head.repo.full_name == github.repository" in job["if"]
     inflight = workflow["jobs"]["drain-inflight"]
+    assert inflight["if"] == "github.event.pull_request.head.repo.full_name == github.repository"
     assert inflight["steps"][0]["name"] == module.INFLIGHT_WAIT_STEP
     assert inflight["steps"][0]["env"]["RELEASE_MARKER"] == "OSDC_DRAIN_RELEASE_abc123"
     held = workflow["jobs"]["drain-held"]
     assert held["needs"] == "drain-inflight"
+    assert held["if"] == "github.event.pull_request.head.repo.full_name == github.repository"
     assert held["name"] == "drain-held (${{ matrix.probe }})"
     gate = held["steps"][0]
     assert gate["name"] == module.HELD_RELEASE_STEP
@@ -56,13 +58,7 @@ def test_group_pinning_and_release_gate():
     assert "monotonic() + 840" in gate["run"]
     assert held["steps"][1]["name"] == "Complete after undrain"
     assert workflow["permissions"] == {"contents": "read", "pull-requests": "read"}
-    assert "action == 'opened'" in held["if"]
     assert held["timeout-minutes"] == 15
-    assert "action == 'opened'" in inflight["if"]
-    wakeup = workflow["jobs"]["drain-wakeup"]
-    assert "action == 'synchronize'" in wakeup["if"]
-    assert "needs" not in wakeup
-    assert wakeup["timeout-minutes"] == 15
     assert len(held["strategy"]["matrix"]["probe"]) == 3
     assert "time.monotonic()" in inflight["steps"][0]["run"]
 

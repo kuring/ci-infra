@@ -3,7 +3,7 @@ name: OSDC Drain Test {{RUN_KEY}}
 "on":
   pull_request:
     # Editing the PR body releases the probe and must not create another run.
-    types: [opened, synchronize]
+    types: [opened]
 
 permissions:
   contents: read
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   drain-inflight:
-    if: github.event.action == 'opened' && github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on:
       group: {{RUNNER_GROUP}}
       labels: [{{PROBE_LABEL}}]
@@ -61,8 +61,8 @@ jobs:
 
   drain-held:
     name: drain-held (${{ matrix.probe }})
-    if: github.event.action == 'opened' && github.event.pull_request.head.repo.full_name == github.repository
     needs: drain-inflight
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on:
       group: {{RUNNER_GROUP}}
       labels: [{{PROBE_LABEL}}]
@@ -116,18 +116,3 @@ jobs:
 
       - name: Complete after undrain
         run: python -c 'print("Held job completed after undrain and placement verification")'
-
-  # New traffic wakes the original queue after capacity restoration
-  # (https://github.com/actions/actions-runner-controller/issues/4715).
-  drain-wakeup:
-    if: github.event.action == 'synchronize' && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on:
-      group: {{RUNNER_GROUP}}
-      labels: [{{PROBE_LABEL}}]
-    timeout-minutes: 15
-    container:
-      image: python:3.12.9-slim
-    steps:
-      - name: Wake original queued jobs
-        run: |
-          python -c 'print("ARC #4715 wakeup")'
