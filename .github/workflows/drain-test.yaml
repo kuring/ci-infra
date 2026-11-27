@@ -1,0 +1,67 @@
+name: OSDC Drain Test service63a003835a614a6ebf9e5d48b6a722db
+'on':
+  pull_request:
+    types:
+    - opened
+    - synchronize
+permissions:
+  contents: read
+jobs:
+  drain:
+    if: ${{ !cancelled() && !failure() && github.event.action == 'opened' }}
+    timeout-minutes: 120
+    concurrency:
+      group: osdc-service-cancel-63a003835a614a6ebf9e5d48b6a722db
+      cancel-in-progress: false
+    name: Cancel drain and recover
+    runs-on:
+    - osdc-service-63a003835a614a6ebf9e5d48b6a722db-drain
+    steps:
+    - name: Check dedicated Kind connection
+      id: aws
+      if: ${{ success() && !cancelled() }}
+      run: just --justfile /root/osdc-drain-no-wakeup-20261126/full-test-rzGWJ0/ci-infra-test/osdc/kind/justfile
+        kind-drain-service-step prepare --output /root/osdc-drain-no-wakeup-20261126/artifacts/evidence/full-dual-arc.rzGWJ0/fork/service
+        --key 63a003835a614a6ebf9e5d48b6a722db
+    - name: Run drain/undrain test
+      id: drain
+      if: ${{ success() && !cancelled() }}
+      timeout-minutes: 90
+      run: just --justfile /root/osdc-drain-no-wakeup-20261126/full-test-rzGWJ0/ci-infra-test/osdc/kind/justfile
+        kind-drain-service-step cancel --output /root/osdc-drain-no-wakeup-20261126/artifacts/evidence/full-dual-arc.rzGWJ0/fork/service
+        --key 63a003835a614a6ebf9e5d48b6a722db
+      env:
+        CLUSTER: kind-local
+        RECOVERY_FILE: ${{ runner.temp }}/osdc-drain-${{ github.run_id }}-${{ github.run_attempt
+          }}.json
+        OSDC_DRAIN_TEST_LIVE: true
+        OSDC_DRAIN_RECOVERY_FILE: ${{ runner.temp }}/osdc-drain-${{ github.run_id
+          }}-${{ github.run_attempt }}.json
+    - name: Resume and verify cluster runners
+      id: restore
+      if: ${{ always() && steps.aws.outcome == 'success' }}
+      timeout-minutes: 11
+      run: just --justfile /root/osdc-drain-no-wakeup-20261126/full-test-rzGWJ0/ci-infra-test/osdc/kind/justfile
+        kind-drain-service-step restore --output /root/osdc-drain-no-wakeup-20261126/artifacts/evidence/full-dual-arc.rzGWJ0/fork/service
+        --key 63a003835a614a6ebf9e5d48b6a722db
+      env:
+        CLUSTER: kind-local
+        RECOVERY_FILE: ${{ runner.temp }}/osdc-drain-${{ github.run_id }}-${{ github.run_attempt
+          }}.json
+        OSDC_DRAIN_TEST_LIVE: true
+        OSDC_DRAIN_RECOVERY_FILE: ${{ runner.temp }}/osdc-drain-${{ github.run_id
+          }}-${{ github.run_attempt }}.json
+  successor:
+    name: Acquire released lock
+    if: ${{ !cancelled() && github.event.action == 'synchronize' }}
+    runs-on:
+    - osdc-service-63a003835a614a6ebf9e5d48b6a722db-next
+    timeout-minutes: 5
+    concurrency:
+      group: osdc-service-cancel-63a003835a614a6ebf9e5d48b6a722db
+      cancel-in-progress: false
+    steps:
+    - name: Verify recovery precedes lock release
+      run: just --justfile /root/osdc-drain-no-wakeup-20261126/full-test-rzGWJ0/ci-infra-test/osdc/kind/justfile
+        kind-drain-service-step successor --output /root/osdc-drain-no-wakeup-20261126/artifacts/evidence/full-dual-arc.rzGWJ0/fork/service
+        --key 63a003835a614a6ebf9e5d48b6a722db
